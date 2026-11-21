@@ -79,9 +79,12 @@ tr:last-child td{border-bottom:0}
 .sec{margin:28px 0 12px;display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
 .hint{color:var(--muted);font-size:.8125rem}
 #booking{margin-bottom:24px;max-width:640px}
+#auth{display:flex;gap:8px;align-items:center}
 .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}
 @media (prefers-reduced-motion:no-preference){.card{transition:border-color .15s}.card:hover{border-color:var(--accent)}}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.57.4/dist/umd/supabase.min.js"></script>
+<script src="config.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -92,8 +95,16 @@ tr:last-child td{border-bottom:0}
       <button role="tab" id="t-owner" aria-selected="false">I own a salon</button>
       <button role="tab" id="t-plat" aria-selected="false" hidden>Platform earnings</button>
     </nav>
+    <div id="auth"></div>
   </header>
   <div class="notice">Prototype. Payments are simulated, so no real money moves. Clients pay a 15% deposit online and the rest at the salon.</div>
+  <div id="authcard" class="card" hidden style="max-width:420px;margin-bottom:20px">
+    <h3 style="margin-bottom:12px">Sign in or create an account</h3>
+    <div class="field"><label for="au-email">Email</label><input id="au-email" type="email" autocomplete="email"></div>
+    <div class="field"><label for="au-pass">Password (6 or more characters)</label><input id="au-pass" type="password" autocomplete="current-password"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="au-in" type="button">Sign in</button><button class="btn ghost" id="au-up" type="button">Create account</button><button class="btn ghost" id="au-x" type="button">Close</button></div>
+    <div id="au-msg" class="msg" role="status"></div>
+  </div>
   <div id="loadnote" class="hint" hidden></div>
 
   <section id="v-find">
@@ -122,11 +133,13 @@ tr:last-child td{border-bottom:0}
     </div>
     <div class="field" style="max-width:360px"><label for="q">Search by salon or area</label><input id="q" type="search" placeholder="e.g. Midrand"></div>
     <div id="salons" class="grid"></div>
+    <div id="my-wrap" hidden><div class="sec"><h3>My bookings</h3></div><div id="my-book"></div></div>
   </section>
 
   <section id="v-owner" hidden>
     <h2>Salon owner dashboard</h2>
     <p class="lead">List your salon for free. GlowBook keeps 15% of each booking as a deposit and you collect the other 85% from the client at your salon.</p>
+    <div id="o-gate" class="notice" hidden>Sign in to list your salon and manage bookings.</div>
     <div id="o-stats" class="stats"></div>
     <div class="card" style="max-width:640px">
       <h3 style="margin-bottom:12px">Add your salon</h3>
@@ -157,6 +170,9 @@ tr:last-child td{border-bottom:0}
 <script>
 (function(){
 const RATE=0.15;
+const CFG=window.GLOWBOOK||{};
+const live=!!(CFG.url&&CFG.key&&window.supabase);
+const sb=live?window.supabase.createClient(CFG.url,CFG.key):null;
 const $=s=>document.querySelector(s);
 function h(tag,props,...kids){const e=document.createElement(tag);
   for(const k in props||{}){const v=props[k];
@@ -172,44 +188,91 @@ const fmtDate=d=>new Date(d+'T00:00:00').toLocaleDateString('en-ZA',{weekday:'sh
 const newId=()=>'x'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
 const TIMES=['09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00'];
 
-let db=null,myId='local',amOwner=false,salons=[],bookings=[],loaded=false,sel=null;
+let session=null,isAdmin=false,myId='local',salons=[],bookings=[],loaded=false,sel=null;
+const note=(t)=>{const n=$('#loadnote');n.hidden=!t;n.textContent=t||'';};
+
+/* ---------- demo mode (no backend configured): data kept in this browser ---------- */
 const KEY='glowbook-sa-v1';
-function persist(){try{localStorage.setItem(KEY,JSON.stringify({salons,bookings}));}catch(e){}}
+function persist(){if(live)return;try{localStorage.setItem(KEY,JSON.stringify({salons,bookings}));}catch(e){}}
 function restore(){try{const d=JSON.parse(localStorage.getItem(KEY)||'null');if(d){salons=d.salons||[];bookings=d.bookings||[];return;}}catch(e){}
   salons=[
    {id:'demo-royal-glow',name:'Royal Glow Salon',area:'Burgersfort',owner:'demo',demo:true,services:[{name:'Box braids',price:650,mins:240},{name:'Gel manicure',price:220,mins:60},{name:'Wash and blow-dry',price:150,mins:45}]},
    {id:'demo-fade-factory',name:'Fade Factory Barbers',area:'Midrand',owner:'demo',demo:true,services:[{name:"Men's fade",price:90,mins:30},{name:'Beard trim',price:60,mins:20},{name:'Kids cut',price:70,mins:30}]},
    {id:'demo-nail-studio',name:"Lerato's Nail Studio",area:'Centurion',owner:'demo',demo:true,services:[{name:'Acrylic full set',price:380,mins:120},{name:'Pedicure',price:250,mins:60}]}];}
 
-/* data layer: shared db when available, in-memory otherwise */
-async function save(col,id,data){
-  if(db){await db.collection(col).doc(id).set(data);return;}
-  const arr=col==='salons'?salons:bookings;const i=arr.findIndex(x=>x.id===id);
-  const row=Object.assign({id},data);if(i>=0)arr[i]=row;else arr.push(row);persist();renderAll();}
-async function remove(col,id){
-  if(db){await db.collection(col).doc(id).delete();return;}
-  if(col==='salons')salons=salons.filter(x=>x.id!==id);else bookings=bookings.filter(x=>x.id!==id);persist();renderAll();}
+/* ---------- data layer ---------- */
+async function loadAll(){
+  if(!live){renderAll();return;}
+  const [s,b]=await Promise.all([sb.from('salons').select('*').order('created_at'),sb.from('bookings').select('*')]);
+  if(s.error||b.error){note('Could not reach the booking database. Check your connection and refresh.');loaded=true;renderAll();return;}
+  note('');
+  salons=(s.data||[]).map(r=>({id:r.id,name:r.name,area:r.area,owner:r.owner_id,services:r.services}));
+  bookings=(b.data||[]).map(r=>({id:r.id,salonId:r.salon_id,salonName:r.salon_name,service:r.service,price:+r.price,deposit:+r.deposit,
+    balance:+r.balance,clientName:r.client_name,phone:r.phone,date:r.booking_date,time:r.booking_time,status:r.status,clientId:r.client_id}));
+  loaded=true;renderAll();
+}
+async function addSalon(name,area,services){
+  if(live){const{error}=await sb.from('salons').insert({name,area,services});if(error)throw error;await loadAll();return;}
+  salons.push({id:newId(),name,area,owner:myId,services});persist();renderAll();}
+async function removeSalon(id){
+  if(live){const{error}=await sb.from('salons').delete().eq('id',id);if(error)return;await loadAll();return;}
+  salons=salons.filter(x=>x.id!==id);persist();renderAll();}
+async function addBooking(b){
+  if(live){const{data,error}=await sb.from('bookings').insert({salon_id:b.salon.id,service:b.svc.name,client_name:b.name,phone:b.phone,
+      booking_date:b.date,booking_time:b.time}).select('id,deposit,balance,price').single();
+    if(error)throw error;await loadAll();return{id:data.id,deposit:+data.deposit,balance:+data.balance};}
+  const dep=cut(b.svc.price),id=newId();
+  bookings.push({id,salonId:b.salon.id,salonName:b.salon.name,service:b.svc.name,price:b.svc.price,deposit:dep,
+    balance:Math.round((b.svc.price-dep)*100)/100,clientName:b.name,phone:b.phone,date:b.date,time:b.time,status:'confirmed',clientId:myId});
+  persist();renderAll();return{id,deposit:dep,balance:b.svc.price-dep};}
+async function setStatus(b,status){
+  if(live){const{error}=await sb.from('bookings').update({status}).eq('id',b.id);if(!error)await loadAll();return;}
+  b.status=status;persist();renderAll();}
 
-/* tabs */
+/* ---------- auth ---------- */
+function openAuth(text){$('#authcard').hidden=false;$('#au-msg').className='msg err';$('#au-msg').textContent=text||'';
+  $('#authcard').scrollIntoView({behavior:'smooth',block:'start'});$('#au-email').focus({preventScroll:true});}
+function renderAuth(){
+  const a=$('#auth');a.replaceChildren();if(!live)return;
+  if(session)a.append(h('span',{class:'hint'},session.user.email),' ',h('button',{class:'btn ghost small',type:'button',onclick:()=>sb.auth.signOut()},'Sign out'));
+  else a.append(h('button',{class:'btn small',type:'button',onclick:()=>openAuth('')},'Sign in'));
+  $('#o-gate').hidden=!(live&&!session);
+}
+$('#au-x').addEventListener('click',()=>{$('#authcard').hidden=true;});
+async function doAuth(kind){
+  const email=$('#au-email').value.trim(),password=$('#au-pass').value,m=$('#au-msg');m.className='msg err';
+  if(!email||password.length<6){m.textContent='Enter your email and a password of at least 6 characters.';return;}
+  const r=kind==='in'?await sb.auth.signInWithPassword({email,password}):await sb.auth.signUp({email,password});
+  if(r.error){m.textContent=r.error.message;return;}
+  if(kind==='up'&&!r.data.session){m.className='msg ok';m.textContent='Account created. Check your email to confirm it, then sign in.';return;}
+  m.className='msg ok';m.textContent='You are signed in.';setTimeout(()=>{$('#authcard').hidden=true;},600);
+}
+$('#au-in').addEventListener('click',()=>doAuth('in'));
+$('#au-up').addEventListener('click',()=>doAuth('up'));
+
+/* ---------- tabs ---------- */
 const tabs={find:['#t-find','#v-find'],owner:['#t-owner','#v-owner'],plat:['#t-plat','#v-plat']};
 function show(name){for(const k in tabs){const on=k===name;$(tabs[k][0]).setAttribute('aria-selected',on);$(tabs[k][1]).hidden=!on;}
   try{history.replaceState(null,'','#'+name)}catch(e){}}
 for(const k in tabs)$(tabs[k][0]).addEventListener('click',()=>show(k));
 
-/* find a salon */
+/* ---------- find a salon ---------- */
 function renderFind(){
   const q=$('#q').value.trim().toLowerCase();
-  const list=salons.filter(s=>!q||(s.name+' '+s.area).toLowerCase().includes(q))
-    .sort((a,b)=>(a.name||'').localeCompare(b.name||''));
+  const list=salons.filter(s=>!q||(s.name+' '+s.area).toLowerCase().includes(q)).sort((a,b)=>(a.name||'').localeCompare(b.name||''));
   const box=$('#salons');box.replaceChildren();
-  if(!list.length){box.append(h('div',{class:'empty'},loaded?(salons.length?'No salon matches that search.':'No salons listed yet. Salon owners can add theirs from the "I own a salon" tab.'):'Loading salons...'));return;}
+  if(!list.length){box.append(h('div',{class:'empty'},loaded?(salons.length?'No salon matches that search.':'No salons listed yet. Salon owners can add theirs from the "I own a salon" tab.'):'Loading salons...'));}
   for(const s of list){
     box.append(h('div',{class:'card salon'},
       h('div',null,h('h3',null,s.name),h('div',{class:'meta'},s.area),s.demo?h('span',{class:'tag',style:'margin-top:6px'},'Demo listing'):null),
       h('div',null,(s.services||[]).map(v=>h('div',{class:'svc'},
         h('div',null,v.name,h('small',null,v.mins+' min')),
         h('div',{style:'text-align:right'},h('div',{class:'price'},money(v.price)),
-          h('button',{class:'btn small',type:'button',onclick:()=>openBooking(s,v)},'Book')))))))); }
+          h('button',{class:'btn small',type:'button',onclick:()=>openBooking(s,v)},'Book')))))));
+  }
+  const mine=bookings.filter(b=>b.clientId===myId);
+  $('#my-wrap').hidden=!mine.length;
+  if(mine.length)$('#my-book').replaceChildren(bookingsTable(mine,false,true));
 }
 $('#q').addEventListener('input',renderFind);
 
@@ -230,9 +293,10 @@ function openBooking(s,v){
   $('#booking').scrollIntoView({behavior:'smooth',block:'start'});
   $('#bk-name').focus({preventScroll:true});
 }
-function fillTimes(){
-  if(!sel)return;const date=$('#bk-date').value;const keep=$('#bk-time').value;
-  const taken=bookings.filter(b=>b.salonId===sel.salon.id&&b.date===date&&b.status!=='cancelled').map(b=>b.time);
+async function fillTimes(){
+  if(!sel)return;const date=$('#bk-date').value;const keep=$('#bk-time').value;let taken=[];
+  if(live){if(date){const r=await sb.rpc('taken_slots',{p_salon:sel.salon.id,p_date:date});taken=r.data||[];}}
+  else taken=bookings.filter(b=>b.salonId===sel.salon.id&&b.date===date&&b.status!=='cancelled').map(b=>b.time);
   const t=$('#bk-time');t.replaceChildren();
   for(const x of TIMES)t.append(h('option',{value:x,disabled:taken.includes(x)},x+(taken.includes(x)?' (booked)':'')));
   if(keep&&!taken.includes(keep))t.value=keep;else{const f=TIMES.find(x=>!taken.includes(x));if(f)t.value=f;}
@@ -241,37 +305,38 @@ $('#bk-date').addEventListener('change',fillTimes);
 $('#bk-close').addEventListener('click',()=>{$('#booking').hidden=true;sel=null;});
 $('#bk-pay').addEventListener('click',async()=>{
   const msg=$('#bk-msg');msg.className='msg err';
+  if(live&&!session){msg.textContent='Sign in or create an account to book.';openAuth('Sign in or create an account to book.');return;}
   const name=$('#bk-name').value.trim(),phone=$('#bk-phone').value.trim(),date=$('#bk-date').value,time=$('#bk-time').value;
   if(!name){msg.textContent='Enter your name.';return;}
   if(phone.replace(/\D/g,'').length<9){msg.textContent='Enter a phone number the salon can reach.';return;}
   if(!date||!time){msg.textContent='Choose a date and time.';return;}
-  const dep=cut(sel.svc.price);const id=newId();const btn=$('#bk-pay');btn.disabled=true;
+  const btn=$('#bk-pay');btn.disabled=true;
   try{
-    await save('bookings',id,{salonId:sel.salon.id,salonName:sel.salon.name,service:sel.svc.name,price:sel.svc.price,
-      deposit:dep,balance:Math.round((sel.svc.price-dep)*100)/100,clientName:name,phone,date,time,clientId:myId,status:'confirmed',created:Date.now()});
+    const r=await addBooking({salon:sel.salon,svc:sel.svc,name,phone,date,time});
     msg.className='msg ok';
-    msg.textContent='Booked. Ref '+id.slice(-5).toUpperCase()+'. '+fmtDate(date)+' at '+time+'. Deposit '+money(dep)+' paid (demo). Bring '+money(sel.svc.price-dep)+' to the salon.';
+    msg.textContent='Booked. Ref '+String(r.id).slice(-5).toUpperCase()+'. '+fmtDate(date)+' at '+time+'. Deposit '+money(r.deposit)+' paid (demo). Bring '+money(r.balance)+' to the salon.';
     $('#bk-name').value='';$('#bk-phone').value='';
-  }catch(e){msg.className='msg err';msg.textContent='Could not save the booking. Check your connection and try again.';}
-  btn.disabled=false;
+  }catch(e){msg.className='msg err';
+    msg.textContent=e&&e.code==='23505'?'That time was just taken. Pick another time.':'Could not save the booking. Check your connection and try again.';}
+  await fillTimes();btn.disabled=false;
 });
 
-/* owner dashboard */
+/* ---------- owner dashboard ---------- */
 function parseServices(text){
   const out=[];for(const line of text.split('\n')){const l=line.trim();if(!l)continue;
     const m=l.match(/^(.+?),\s*R?\s*(\d+(?:\.\d+)?)\s*(?:,\s*(\d+))?\s*(?:min)?$/i);
-    if(!m)return {error:'Could not read "'+l+'". Use: name, price, minutes.'};
+    if(!m)return{error:'Could not read "'+l+'". Use: name, price, minutes.'};
     out.push({name:m[1].trim(),price:parseFloat(m[2]),mins:parseInt(m[3]||'60',10)});}
   return out.length?{list:out}:{error:'Add at least one service.'};}
 $('#os-add').addEventListener('click',async()=>{
   const msg=$('#os-msg');msg.className='msg err';
+  if(live&&!session){msg.textContent='Sign in first to list your salon.';openAuth('Sign in to list your salon.');return;}
   const name=$('#os-name').value.trim(),area=$('#os-area').value.trim();
   if(!name||!area){msg.textContent='Enter the salon name and area.';return;}
   const p=parseServices($('#os-svc').value);if(p.error){msg.textContent=p.error;return;}
-  try{await save('salons',newId(),{name,area,owner:myId,services:p.list,created:Date.now()});
-    msg.className='msg ok';msg.textContent=name+' is now listed.';
+  try{await addSalon(name,area,p.list);msg.className='msg ok';msg.textContent=name+' is now listed.';
     $('#os-name').value='';$('#os-area').value='';$('#os-svc').value='';
-  }catch(e){msg.textContent='Could not save. Sign in to claude.ai and try again.';}
+  }catch(e){msg.textContent='Could not save the salon. Try again.';}
 });
 function bookingsTable(rows,actions,showSalon){
   if(!rows.length)return h('div',{class:'empty'},'No bookings yet.');
@@ -279,7 +344,7 @@ function bookingsTable(rows,actions,showSalon){
   if(actions)head.push('');
   return h('div',{class:'scroll'},h('table',null,
     h('thead',null,h('tr',null,head.map(x=>h('th',null,x)))),
-    h('tbody',null,rows.sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).map(b=>h('tr',null,
+    h('tbody',null,rows.slice().sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).map(b=>h('tr',null,
       h('td',null,fmtDate(b.date),h('div',{class:'hint'},b.time)),
       h('td',null,b.clientName,h('div',{class:'hint'},b.phone)),
       h('td',null,showSalon?[b.salonName,h('div',{class:'hint'},b.service)]:b.service),
@@ -289,55 +354,53 @@ function bookingsTable(rows,actions,showSalon){
         h('button',{class:'btn small',type:'button',onclick:()=>setStatus(b,'completed')},'Completed'),' ',
         h('button',{class:'btn small danger',type:'button',onclick:()=>setStatus(b,'cancelled')},'Cancel')]:null):null)))));
 }
-async function setStatus(b,status){const{id,...rest}=b;try{await save('bookings',id,Object.assign(rest,{status}));}catch(e){}}
 function renderOwner(){
   const mine=salons.filter(s=>s.owner===myId);const ids=mine.map(s=>s.id);
-  const mb=bookings.filter(b=>ids.includes(b.salonId));const live=mb.filter(b=>b.status!=='cancelled');
-  const st=$('#o-stats');st.replaceChildren(
-    h('div',{class:'stat'},h('b',null,String(live.length)),h('span',null,'active bookings')),
-    h('div',{class:'stat'},h('b',null,money(live.filter(b=>b.status==='confirmed').reduce((a,b)=>a+b.balance,0))),h('span',null,'to collect at your salon')),
-    h('div',{class:'stat'},h('b',null,money(live.filter(b=>b.status==='completed').reduce((a,b)=>a+b.price,0))),h('span',null,'completed services')),
-    h('div',{class:'stat fee'},h('b',null,money(live.reduce((a,b)=>a+b.deposit,0))),h('span',null,'GlowBook commission (15%)')));
+  const mb=bookings.filter(b=>ids.includes(b.salonId));const lv=mb.filter(b=>b.status!=='cancelled');
+  $('#o-stats').replaceChildren(
+    h('div',{class:'stat'},h('b',null,String(lv.length)),h('span',null,'active bookings')),
+    h('div',{class:'stat'},h('b',null,money(lv.filter(b=>b.status==='confirmed').reduce((a,b)=>a+b.balance,0))),h('span',null,'to collect at your salon')),
+    h('div',{class:'stat'},h('b',null,money(lv.filter(b=>b.status==='completed').reduce((a,b)=>a+b.price,0))),h('span',null,'completed services')),
+    h('div',{class:'stat fee'},h('b',null,money(lv.reduce((a,b)=>a+b.deposit,0))),h('span',null,'GlowBook commission (15%)')));
   const g=$('#o-salons');g.replaceChildren();
   if(!mine.length)g.append(h('div',{class:'empty'},'You have not listed a salon yet. Add one above.'));
   for(const s of mine)g.append(h('div',{class:'card salon'},h('div',null,h('h3',null,s.name),h('div',{class:'meta'},s.area)),
     h('div',{class:'hint'},(s.services||[]).map(v=>v.name+' '+money(v.price)).join(' · ')),
-    h('div',null,h('button',{class:'btn small danger',type:'button',onclick:()=>remove('salons',s.id)},'Remove listing'))));
+    h('div',null,h('button',{class:'btn small danger',type:'button',onclick:()=>removeSalon(s.id)},'Remove listing'))));
   $('#o-book').replaceChildren(bookingsTable(mb,true,true));
 }
 function renderPlat(){
-  const live=bookings.filter(b=>b.status!=='cancelled');
-  const sum=k=>live.reduce((a,b)=>a+b[k],0);
+  const lv=bookings.filter(b=>b.status!=='cancelled');const sum=k=>lv.reduce((a,b)=>a+b[k],0);
   $('#p-stats').replaceChildren(
     h('div',{class:'stat fee'},h('b',null,money(sum('deposit'))),h('span',null,'commission earned')),
     h('div',{class:'stat'},h('b',null,money(sum('price'))),h('span',null,'total booked value')),
-    h('div',{class:'stat'},h('b',null,String(live.length)),h('span',null,'bookings')),
+    h('div',{class:'stat'},h('b',null,String(lv.length)),h('span',null,'bookings')),
     h('div',{class:'stat'},h('b',null,String(salons.length)),h('span',null,'salons listed')));
-  $('#p-book').replaceChildren(bookingsTable(bookings.slice(),false,true));
+  $('#p-book').replaceChildren(bookingsTable(bookings,false,true));
 }
-function renderAll(){renderFind();renderOwner();renderPlat();fillTimes();
-  $('#t-plat').hidden=!(amOwner||!db);}
+function renderAll(){renderFind();renderOwner();renderPlat();$('#t-plat').hidden=live?!isAdmin:false;}
 
-/* start */
+/* ---------- start ---------- */
+async function refreshUser(s){
+  session=s;myId=s?s.user.id:'local';isAdmin=false;
+  if(live&&s){const r=await sb.rpc('is_admin');isAdmin=r.data===true;}
+  renderAuth();
+}
 (async()=>{
-  try{const user=window.claude&&await window.claude.use('user');
-    if(user){myId=(await user.id())||'local';amOwner=await user.isOwner();}}catch(e){}
-  try{db=window.claude?await window.claude.use('db'):null;}catch(e){db=null;}
-  if(db){
-    const note=$('#loadnote');
-    const timer=setTimeout(()=>{note.hidden=false;note.textContent='Still connecting to the shared data. What you see may be out of date.';},10000);
-    const done=s=>{clearTimeout(timer);if(!s.metadata.fromCache){note.hidden=true;}loaded=true;};
-    db.collection('salons').onSnapshot(s=>{salons=s.docs.map(d=>Object.assign({id:d.id},d.data()));done(s);renderAll();},
-      ()=>{loaded=true;renderAll();});
-    db.collection('bookings').onSnapshot(s=>{bookings=s.docs.map(d=>Object.assign({id:d.id},d.data()));renderAll();},()=>{});
-  }else{restore();loaded=true;
-    const note=$('#loadnote');note.hidden=false;note.textContent='Demo mode: data is saved in this browser only. A backend is needed to share bookings between clients and salons.';}
-  const hash=(location.hash||'').slice(1);if(tabs[hash]&&!(hash==='plat'&&$('#t-plat').hidden))show(hash);
-  renderAll();
+  if(live){
+    const{data}=await sb.auth.getSession();await refreshUser(data.session);
+    sb.auth.onAuthStateChange((ev,s)=>{if(ev==='INITIAL_SESSION')return;setTimeout(async()=>{await refreshUser(s);await loadAll();},0);});
+    await loadAll();
+    setInterval(()=>{if(document.visibilityState==='visible')loadAll();},30000);
+  }else{
+    restore();loaded=true;
+    note('Demo mode: data is saved in this browser only. Add your Supabase details in config.js to share bookings between people.');
+    renderAuth();renderAll();
+  }
+  const hash=(location.hash||'').slice(1);if(tabs[hash]&&!$(tabs[hash][0]).hidden)show(hash);
 })();
 renderAll();
 })();
 </script>
-
 </body>
 </html>
